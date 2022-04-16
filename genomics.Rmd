@@ -1,0 +1,203 @@
+---
+title: "Untitled"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plotly)
+library(tidyverse)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+CCLE <- PharmacoGx::downloadPSet('CCLE')
+```
+
+## GitHub Documents
+
+This is an R Markdown format used for publishing markdown documents to GitHub. When you click the **Knit** button all R code chunks are run and a markdown file (.md) suitable for publishing to GitHub is generated.
+
+## Including Code
+
+You can include R code in the document as follows:
+
+```{r cars}
+
+ profiles <- as.data.frame(CCLE@sensitivity$profiles) %>%
+  tibble::rownames_to_column('ID') %>%
+  separate('ID', into = c('ID', 'drug.name', 'CCLE.cellid'), sep = '_') %>%
+  dplyr::filter(drug.name == sample(drug.name, 1)) %>%
+  mutate(
+    Group = case_when(
+      ic50_published >= quantile(ic50_published)[4] | is.na(ic50_published) ~ "Resistant",
+      ic50_published <= quantile(ic50_published)[2] ~ "Sensitive",
+      ic50_published < quantile(ic50_published)[4] & ic50_published > quantile(ic50_published)[2]~ 'Intermediate')) 
+  
+
+g <- ggplot(data = profiles, aes(x = rank(ic50_published, ties.method = 'random'), y = log10(ic50_published))) +
+  geom_col(aes(color = CCLE.cellid)) +
+  labs(x = 'Rank', y = "l0g10 IC50") +
+  scale_color_viridis_d(option = 'D', direction = -1)
+
+p <- ggplotly(g) %>%
+  layout(showlegend = F)
+
+p
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r Cell Line, echo=FALSE}
+
+s <- left_join(profiles, CCLE@cell) %>%
+  mutate(CCLE.cellid = str_replace_all(CCLE.cellid, "-", "")) %>%
+  unite('Group', c(drug.name, Group, tissueid, CCLE.cellid), sep = "-") %>%
+  group_by(Group) %>%
+    summarise(
+      count = n()) %>%
+  ungroup()
+
+
+sunburstR::sunburst(s, color= sample(viridis::viridis(1000), nrow(s)))
+
+
+```
+
+```{r}
+
+e <- right_join(CCLE@cell, data.frame(CCLE@molecularProfiles$rna)) %>%
+  pivot_longer(cols = contains("ENS"), 
+               names_to='ENSEMBL',
+               values_to = 'Expression',
+               values_drop_na = T,
+               values_transform = list('Expression' = function(x) 2^as.numeric(x))) %>%
+  ungroup() %>%
+  inner_join(profiles) %>%
+  dplyr::filter(Group %in% c('Sensitive', 'Resistant')) %>%
+  mutate(ENSEMBL = str_extract(ENSEMBL, 'ENSG\\d+')) %>%
+  group_by(ENSEMBL) %>%
+  mutate(`P-value` = try(t.test(Expression~Group)$p.value)) %>%
+  group_by(ENSEMBL, `P-value`, Group) %>%
+  summarise(
+    Mean = mean(Expression, na.rm =T),
+    StdDev = sd(Expression, na.rm = T)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = Group, values_from = c(Mean, StdDev)) %>%
+  ungroup() %>%
+  mutate(fold.change = ifelse(Mean_Sensitive > Mean_Resistant, -Mean_Sensitive/Mean_Resistant, Mean_Resistant/Mean_Sensitive),
+         Classification = ifelse(fold.change>0, 'Resistant', 'Sensitive'))
+  
+diffex <- right_join(ensembldb::select(org.Hs.eg.db, keys=e$ENSEMBL,
+                                          columns=c( "SYMBOL", "ENTREZID"), keytype="ENSEMBL"),
+             e) %>%
+    arrange(`P-value`)
+
+  data.table::data.table(diffex)
+
+
+```
+
+```{r}
+g <- ggplot(data=diffex, aes(x = fold.change, y = -log10(`P-value`), color = Classification)) +
+  geom_point(fill = 'black', alpha = 0.5) +
+  geom_vline(xintercept = 0) +
+  geom_text(aes(label = ifelse(rank(`P-value`) < 10, SYMBOL, "")), size = 2, hjust = rep(c(0, 1), length.out=nrow(diffex)), color = 'black', alpha =0.7) +
+  viridis:::scale_color_viridis(end = 0.5, discrete = T)
+
+plotly::ggplotly(g)
+
+```
+
+```{r}
+
+gosen <- gprofiler2::gost(query = diffex$SYMBOL[diffex$fold.change > 0][1:60], 
+                organism = "hsapiens", ordered_query = TRUE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = NULL, as_short_link = FALSE)$result %>%
+  arrange(p_value) %>%
+  separate_rows(intersection) %>%
+  bind_rows()  %>%
+  dplyr::rename(
+    GO = source,
+    from = intersection,
+    to = term_name
+  ) %>%
+  group_by(to, from, p_value, precision, GO) %>%
+  summarise_all(unique) %>%
+  ungroup()
+nodes <- gosen %>%
+  group_by(from) %>%
+  slice_head(n=1) %>%
+  dplyr::rename(names = from)
+
+network <- igraph::graph_from_data_frame(d=gosen,directed=F)
+
+plot(network,  
+    vertex.size=c(5),  
+    vertex.label =unique(gosen$from), # Size of the node (default is 15)
+    vertex.label.color=viridis::viridis(n=length(gosen$to)), 
+    vertex.label.family="Arial",                   # Font family of the label (e.g.“Times”, “Helvetica”)
+    vertex.label.font=c(0.25, 1),                  # Font: 1 plain, 2 bold, 3, italic, 4 bold italic, 5 symbol
+   vertex.label.cex=c(0.5,0.5,0.5),                 # Font size (multiplication factor, device-dependent)
+    vertex.label.dist=2,   
+   vertex.color = viridis::viridis(n=length(unique(gosen$to))),  # Distance between the label and the vertex
+    vertex.label.degree=0 ,        
+   edge.color='black',           # Edge color
+    edge.width=seq(1),                        # Edge width, defaults to 1
+    edge.arrow.size=1,                           # Arrow size, defaults to 1
+    edge.arrow.width=1,                          # Arrow width, defaults to 1
+    edge.lty=c("solid")
+)
+
+```
+
+
+```{r}
+
+
+gores <- gprofiler2::gost(query = diffex$SYMBOL[diffex$fold.change > 0][1:60], 
+                organism = "hsapiens", ordered_query = TRUE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = NULL, as_short_link = FALSE)$result %>%
+  arrange(p_value) %>%
+  separate_rows(intersection) %>%
+  bind_rows()  %>%
+  dplyr::rename(
+    GO = source,
+    from = intersection,
+    to = term_name
+  ) %>%
+  group_by(to, from, p_value, precision, GO) %>%
+  summarise_all(unique) %>%
+  ungroup()
+
+network <- igraph::graph_from_data_frame(d=gores,directed=F)
+
+plot(network,  
+    vertex.size=c(5),  
+    vertex.label = unique(gores$from), # Size of the node (default is 15)
+    vertex.label.color=viridis::viridis(n=length(gores$from)),
+    vertex.label.family="Arial",                   # Font family of the label (e.g.“Times”, “Helvetica”)
+    vertex.label.font=c(0.25, 1),                  # Font: 1 plain, 2 bold, 3, italic, 4 bold italic, 5 symbol
+   vertex.label.cex=c(0.5,0.5,0.5),                 # Font size (multiplication factor, device-dependent)
+    vertex.label.dist=2,   
+   vertex.color = viridis::viridis(n=length(gores$to)),  # Distance between the label and the vertex
+    vertex.label.degree=0 ,        
+   edge.color='black',           # Edge color
+    edge.width=seq(1),                        # Edge width, defaults to 1
+    edge.arrow.size=1,                           # Arrow size, defaults to 1
+    edge.arrow.width=1,                          # Arrow width, defaults to 1
+    edge.lty=c("solid")
+)
+
+```
